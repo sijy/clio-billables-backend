@@ -1,81 +1,62 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+import requests, os
+from dotenv import load_dotenv
 from pydantic import BaseModel
-import google.generativeai as genai
-import os
-import requests
-from fastapi.middleware.cors import CORSMiddleware
-from datetime import date
 
+load_dotenv()
 app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"]
-)
+CLIENT_ID = os.getenv("CLIO_CLIENT_ID")
+CLIENT_SECRET = os.getenv("CLIO_CLIENT_SECRET")
+REDIRECT_URI = os.getenv("CLIO_REDIRECT_URI")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Init Gemini
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-model = genai.GenerativeModel("gemini-pro")
+clio_token = None  # In-memory for MVP
 
-CLIO_TOKEN = os.getenv("CLIO_TOKEN")
+@app.get("/auth/clio/login")
+def auth_redirect():
+    url = f"https://app.clio.com/oauth/authorize?client_id={CLIENT_ID}&redirect_uri={REDIRECT_URI}&response_type=code&scope=read:contacts read:matters write:time_entries"
+    return {"url": url}
+
+@app.get("/auth/clio/callback")
+def auth_callback(code: str):
+    global clio_token
+    token_url = "https://app.clio.com/oauth/token"
+    res = requests.post(token_url, data={
+        "grant_type": "authorization_code",
+        "code": code,
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "redirect_uri": REDIRECT_URI
+    })
+    clio_token = res.json()["access_token"]
+    return {"message": "Token received"}
 
 class EmailData(BaseModel):
     body: str
-    recipients: list
-    duration: float
+    seconds: int
 
-@app.post("/log-billable")
-def log_billable(data: EmailData):
-    try:
-        summary = get_gemini_summary(data.body)
-        contact = find_contact_by_email(data.recipients[0])
-        matter = get_matter_for_contact(contact['id'])
+@app.post("/api/log")
+def log_email(data: EmailData):
+    global clio_token
+    minutes = round(data.seconds / 60, 2)
+    
+    # Step 1: Use Gemini to summarize
+    summary = requests.post(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=" + GEMINI_API_KEY,
+        json={"contents": [{"parts": [{"text": f"Summarize this email into a time entry: {data.body}"}]}]}
+    ).json()["candidates"][0]["content"]["parts"][0]["text"]
 
-        payload = {
+    # Step 2: Log to Clio (dummy matter_id for now)
+    res = requests.post(
+        "https://app.clio.com/api/v4/time_entries",
+        headers={"Authorization": f"Bearer {clio_token}"},
+        json={
             "time_entry": {
                 "description": summary,
-                "duration": round(data.duration, 1),
-                "matter_id": matter["id"],
-                "user_id": "me",
-                "date": str(date.today()),
-                "billable": True
+                "duration": int(data.seconds),
+                "matter_id": "your_matter_id_here"
             }
         }
-
-        r = requests.post(
-            "https://app.clio.com/api/v4/time_entries",
-            headers={"Authorization": f"Bearer {CLIO_TOKEN}"},
-            json=payload
-        )
-        return {"status": r.status_code, "response": r.json()}
-    except Exception as e:
-        return {"error": str(e)}
-
-def get_gemini_summary(body):
-    prompt = f"""
-Summarize this email into a professional legal time entry:
-
-Email:
----
-{body}
----
-Format: Email to [Client] regarding [Topic]. Duration: X minutes.
-    """
-    response = model.generate_content(prompt)
-    return response.text.strip()
-
-def find_contact_by_email(email):
-    r = requests.get(
-        f"https://app.clio.com/api/v4/contacts?query={email}",
-        headers={"Authorization": f"Bearer {CLIO_TOKEN}"}
     )
-    return r.json()["data"][0]
-
-def get_matter_for_contact(contact_id):
-    r = requests.get(
-        f"https://app.clio.com/api/v4/matters?client_id={contact_id}",
-        headers={"Authorization": f"Bearer {CLIO_TOKEN}"}
-    )
-    return r.json()["data"][0]
+    return {"summary": summary, "minutes": minutes, "clio_response": res.json()}
